@@ -1,0 +1,103 @@
+name: Build Images and Handle Uffizzi Previews.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened,reopened,synchronize]
+
+jobs:
+  build-postgraphile:
+    name: Build and Push `postgraphile`
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Set Build Variables
+        run: |
+          if [[ "$GITHUB_REF" =~ ^refs/tags/v* ]]; then
+            echo "Using TAG mode: $GITHUB_REF_NAME"
+            echo "REL_VERSION=$GITHUB_REF_NAME" >> $GITHUB_ENV
+            echo "REL_VERSION_STRICT=${GITHUB_REF_NAME#?}" >> $GITHUB_ENV
+          else
+            echo "Using BRANCH mode: v$BASE_DEV_VERSION-dev.$GITHUB_RUN_NUMBER"
+            echo "REL_VERSION=v$BASE_DEV_VERSION-dev.$GITHUB_RUN_NUMBER" >> $GITHUB_ENV
+            echo "REL_VERSION_STRICT=$BASE_DEV_VERSION-dev.$GITHUB_RUN_NUMBER" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Generate UUID image name
+        id: uuid
+        run: echo "::set-output name=uuid::$(uuidgen)"
+      
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v3
+        with:
+          images: ttl.sh/${{ steps.uuid.outputs.uuid }}
+          tags: type=raw,value=24h
+  
+      - name: Build and Push Image to ttl.sh Ephemeral Registry
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          context: ./
+
+  render-compose-file:
+    name: Render Docker Compose File
+    runs-on: ubuntu-latest
+    needs: 
+      - build-postgraphile
+    outputs:
+      compose-file-cache-key: ${{ steps.hash.outputs.hash }}
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+      - name: Render Compose File
+        run: |
+          POSTGRAPHILE_IMAGE=$(echo ${{ needs.build-postgraphile.outputs.tags }})
+          export POSTGRAPHILE_IMAGE
+          # Render simple template from environment variables.
+          envsubst < docker-compose.uffizzi.yml > docker-compose.rendered.yml
+          cat docker-compose.rendered.yml
+      - name: Hash Rendered Compose File
+        id: hash
+        run: echo "::set-output name=hash::$(md5sum docker-compose.rendered.yml | awk '{ print $1 }')"
+      - name: Cache Rendered Compose File
+        uses: actions/cache@v3
+        with:
+          path: docker-compose.rendered.yml
+          key: ${{ steps.hash.outputs.hash }}
+
+  deploy-uffizzi-preview:
+    name: Use Remote Workflow to Preview on Uffizzi
+    needs:
+      - render-compose-file
+    uses: UffizziCloud/preview-action/.github/workflows/reusable.yaml@v2
+    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+    with:
+      compose-file-cache-key: ${{ needs.render-compose-file.outputs.compose-file-cache-key }}
+      compose-file-cache-path: docker-compose.rendered.yml
+      server: https://app.uffizzi.com/
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+  delete-uffizzi-preview:
+    name: Use Remote Workflow to Delete an Existing Preview
+    uses: UffizziCloud/preview-action/.github/workflows/reusable.yaml@v2
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' }}
+    with:
+      compose-file-cache-key: ''
+      compose-file-cache-path: docker-compose.rendered.yml
+      server: https://app.uffizzi.com/
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
